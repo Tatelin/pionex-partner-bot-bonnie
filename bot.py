@@ -232,15 +232,15 @@ def _to_float(v: Any) -> float:
 
 @dataclass
 class Account:
-    label: str               # 顯示用 (例 "A 號" / "B 號")
+    label: str               # 顯示用 (例 "bonnie")
     client: PionexClient
-    bot_id_kol: str | None   # 純 KOL 檢查用 (Min Balance 0)
-    bot_id_asset: str | None  # 資產門檻檢查用 (Min Balance X)
+    bot_id_kol: str | None        # 純 KOL 檢查用 (Min Balance 0)
+    bot_id_asset: str | None      # 低門檻資產（例 200 USDT）
+    bot_id_asset_high: str | None  # 高門檻資產（例 1000 USDT）
 
     @property
     def bot_id_default(self) -> str | None:
-        """/check 與純 UID 訊息用：優先 KOL bot，退而求其次用 ASSET bot。"""
-        return self.bot_id_kol or self.bot_id_asset
+        return self.bot_id_kol or self.bot_id_asset or self.bot_id_asset_high
 
 
 # ---------------------------------------------------------------------------
@@ -284,13 +284,13 @@ HELP_TEXT = (
     "🤖 <b>Bonnie KOL 查詢機器人</b>\n\n"
     "<b>快速查詢（短回覆）</b>\n"
     "• <code>/kol &lt;UID&gt;</code> — 是否為 Bonnie 邀請的 KOL 用戶\n"
-    "• <code>/asset &lt;UID&gt;</code> — KOL + 資產是否達門檻\n\n"
+    "• <code>/asset &lt;UID&gt;</code> — 資產達到的最高門檻（200 / 1000 USDT）\n\n"
     "<b>完整報告（含交易量）</b>\n"
     "• 直接貼 UID：<code>12345678</code> — 近 30 天\n"
     "• 一次最多 20 個（空白、逗號或換行分隔）\n"
     "• <code>/check &lt;UID&gt; &lt;天數&gt;</code> — 例：<code>/check 12345678 7</code>\n"
     "• <code>/check &lt;UID&gt; &lt;YYYY-MM-DD&gt; &lt;YYYY-MM-DD&gt;</code> — 自訂區間\n\n"
-    "UID 為 8 位純數字。"
+    "UID 為 8 位純數字。資產判定會自動顯示達到的最高門檻。"
 )
 
 
@@ -300,12 +300,14 @@ class TGBot:
         accounts: list[Account],
         allowed_chat_ids: set[int],
         asset_threshold_label: str | None,
+        asset_high_threshold_label: str | None = None,
     ):
         assert accounts, "至少要有一個帳號"
         self.accounts = accounts
         self.allowed_chat_ids = allowed_chat_ids
-        # 例 "200 USDT"；用於 /asset 回覆顯示，純文字無 API 行為
+        # 例 "200 USDT" / "1000 USDT"；純文字 label，無 API 行為
         self.asset_threshold_label = asset_threshold_label or ""
+        self.asset_high_threshold_label = asset_high_threshold_label or ""
 
     def _is_allowed(self, update: Update) -> bool:
         chat = update.effective_chat
@@ -368,7 +370,11 @@ class TGBot:
         )
         per_acct = await self._check_full_all(uid, start, end)
         await thinking.edit_text(
-            format_full_result(uid, label, per_acct, self.asset_threshold_label),
+            format_full_result(
+                uid, label, per_acct,
+                self.asset_threshold_label,
+                self.asset_high_threshold_label,
+            ),
             parse_mode=ParseMode.HTML,
         )
 
@@ -399,9 +405,12 @@ class TGBot:
         if not self._is_allowed(update):
             self._reject_log(update, "/asset")
             return
-        if not any(a.bot_id_asset for a in self.accounts):
+        has_any = any(
+            a.bot_id_asset or a.bot_id_asset_high for a in self.accounts
+        )
+        if not has_any:
             await update.message.reply_text(
-                "❌ 沒有任何帳號設定 PIONEX_*_BOT_ID_ASSET，無法使用 /asset"
+                "❌ 沒有任何帳號設定 PIONEX_*_BOT_ID_ASSET[_HIGH]，無法使用 /asset"
             )
             return
         args = ctx.args or []
@@ -412,13 +421,17 @@ class TGBot:
         thinking = await update.message.reply_text(
             f"🔍 資產門檻檢查 <code>{uid}</code>…", parse_mode=ParseMode.HTML
         )
-        per_acct = await self._check_qual_all(uid, "asset")
+        low_results, high_results = await asyncio.gather(
+            self._check_qual_all(uid, "asset_low"),
+            self._check_qual_all(uid, "asset_high"),
+        )
         await thinking.edit_text(
-            format_short_qual_multi(
+            format_asset_tier_multi(
                 uid,
-                per_acct,
-                mode="asset",
-                threshold_label=self.asset_threshold_label,
+                low_results,
+                high_results,
+                self.asset_threshold_label,
+                self.asset_high_threshold_label,
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -453,7 +466,11 @@ class TGBot:
             )
             per_acct = await self._check_full_all(uids[0], start, end)
             await thinking.edit_text(
-                format_full_result(uids[0], label, per_acct),
+                format_full_result(
+                    uids[0], label, per_acct,
+                    self.asset_threshold_label,
+                    self.asset_high_threshold_label,
+                ),
                 parse_mode=ParseMode.HTML,
             )
         else:
@@ -465,7 +482,11 @@ class TGBot:
             )
             items = list(zip(uids, all_results))
             await thinking.edit_text(
-                format_batch_multi(label, items),
+                format_batch_multi(
+                    label, items,
+                    self.asset_threshold_label,
+                    self.asset_high_threshold_label,
+                ),
                 parse_mode=ParseMode.HTML,
             )
 
@@ -476,10 +497,23 @@ class TGBot:
     async def _check_qual_all(
         self, uid: str, mode: str
     ) -> list[tuple[Account, Any]]:
-        """對所有帳號平行呼叫 checkQualification。mode = 'kol' | 'asset'。"""
+        """對所有帳號平行呼叫 checkQualification。
+
+        mode = 'kol' | 'asset_low' | 'asset_high'
+        """
         loop = asyncio.get_running_loop()
+
+        def pick_bot(a: Account) -> str | None:
+            if mode == "kol":
+                return a.bot_id_kol
+            if mode == "asset_low":
+                return a.bot_id_asset
+            if mode == "asset_high":
+                return a.bot_id_asset_high
+            return None
+
         async def one(a: Account) -> tuple[Account, Any]:
-            bot_id = a.bot_id_kol if mode == "kol" else a.bot_id_asset
+            bot_id = pick_bot(a)
             if not bot_id:
                 return a, {"_skip": True}
             try:
@@ -494,10 +528,10 @@ class TGBot:
 
     async def _check_full_all(
         self, uid: str, start: str, end: str
-    ) -> list[tuple[Account, Any, Any, Any]]:
-        """對所有帳號平行做 KOL + ASSET qualification + 交易量。
+    ) -> list[tuple[Account, Any, Any, Any, Any]]:
+        """對所有帳號平行做 KOL + 低門檻 + 高門檻 + 交易量。
 
-        Returns list of (account, kol_qual, asset_qual, vol).
+        Returns list of (account, kol_qual, asset_low_qual, asset_high_qual, vol).
         若某帳號沒設定對應 bot_id，相應槽位回 {"_skip": True}。
         """
         loop = asyncio.get_running_loop()
@@ -513,10 +547,10 @@ class TGBot:
                 log.exception("checkQualification failed account=%s uid=%s", a.label, uid)
                 return {"_error": str(e)}
 
-        async def one(a: Account) -> tuple[Account, Any, Any, Any]:
-            # 同帳號內 KOL/ASSET 平行；交易量也平行
+        async def one(a: Account) -> tuple[Account, Any, Any, Any, Any]:
             kol_t = call_qual(a, a.bot_id_kol)
-            asset_t = call_qual(a, a.bot_id_asset)
+            low_t = call_qual(a, a.bot_id_asset)
+            high_t = call_qual(a, a.bot_id_asset_high)
 
             async def vol_call():
                 try:
@@ -527,8 +561,10 @@ class TGBot:
                     log.exception("inviteTradeStat failed account=%s", a.label)
                     return {"_error": str(e)}
 
-            kol_q, asset_q, vol = await asyncio.gather(kol_t, asset_t, vol_call())
-            return a, kol_q, asset_q, vol
+            kol_q, low_q, high_q, vol = await asyncio.gather(
+                kol_t, low_t, high_t, vol_call()
+            )
+            return a, kol_q, low_q, high_q, vol
 
         return await asyncio.gather(*(one(a) for a in self.accounts))
 
@@ -550,6 +586,107 @@ def _qual_status(qual: Any) -> tuple[str, bool | None]:
     if qualified is False:
         return "❌", False
     return "⚠️", None
+
+
+def _asset_tier_for(
+    low_q: Any, high_q: Any
+) -> str:
+    """回傳 "high" / "low" / "none" / "unknown"，給單一帳號的兩個 qual 判斷。"""
+    high_ok = _qual_status(high_q)[1] is True
+    low_ok = _qual_status(low_q)[1] is True
+    if high_ok:
+        return "high"
+    if low_ok:
+        return "low"
+    # 都是 False 才算 none；若都 unknown / skip 則回 unknown
+    high_judged = _qual_status(high_q)[1] is not None
+    low_judged = _qual_status(low_q)[1] is not None
+    if high_judged or low_judged:
+        return "none"
+    return "unknown"
+
+
+def _overall_asset_tier(
+    pairs: list[tuple[Any, Any]],
+) -> tuple[str, list[str]]:
+    """跨帳號取最高 tier，回傳 (tier, hit_account_labels_for_that_tier).
+
+    pairs = list of (low_q, high_q)；但因為要回 label，外層傳 (account, low, high) 比較順手——
+    為了不重新設計，這裡只回 tier 字串，hit accounts 由呼叫端自己算。
+    """
+    tier_rank = {"high": 3, "low": 2, "none": 1, "unknown": 0}
+    best = "unknown"
+    for low_q, high_q in pairs:
+        t = _asset_tier_for(low_q, high_q)
+        if tier_rank[t] > tier_rank[best]:
+            best = t
+    return best, []
+
+
+def format_asset_tier_multi(
+    uid: str,
+    low_results: list[tuple[Account, Any]],
+    high_results: list[tuple[Account, Any]],
+    low_label: str,
+    high_label: str,
+) -> str:
+    """/asset 短回覆：顯示「達到的最高 tier」+ 各帳號明細。
+
+    low_results / high_results 是同樣帳號順序，因此能 zip 配對。
+    """
+    # 對齊 by Account
+    low_map = {id(a): q for a, q in low_results}
+    high_map = {id(a): q for a, q in high_results}
+    accounts = [a for a, _ in low_results]  # low/high 順序相同
+
+    high_hits: list[str] = []
+    low_hits: list[str] = []
+    detail_lines: list[str] = []
+    for a in accounts:
+        lq = low_map.get(id(a), {"_skip": True})
+        hq = high_map.get(id(a), {"_skip": True})
+        tier = _asset_tier_for(lq, hq)
+        if tier == "high":
+            high_hits.append(a.label)
+        elif tier == "low":
+            low_hits.append(a.label)
+
+        low_icon = _qual_status(lq)[0]
+        high_icon = _qual_status(hq)[0]
+        low_set = a.bot_id_asset is not None
+        high_set = a.bot_id_asset_high is not None
+        parts = []
+        if low_set:
+            parts.append(f"≥{low_label or '低門檻'} {low_icon}")
+        if high_set:
+            parts.append(f"≥{high_label or '高門檻'} {high_icon}")
+        if not parts:
+            parts.append("— (未設定 asset bot)")
+        detail_lines.append(f"  • {a.label}：" + " / ".join(parts))
+
+    # 整體判定（取最高 tier）
+    if high_hits:
+        header = f"✅ <b>達到高門檻</b>：資產 ≥ {high_label or '高門檻'}（{', '.join(high_hits)}）"
+    elif low_hits:
+        header = f"✅ <b>達到低門檻</b>：資產 ≥ {low_label or '低門檻'}（{', '.join(low_hits)}）"
+    else:
+        # 看是否至少有判讀
+        any_judged = any(
+            _qual_status(q)[1] is not None
+            for _, q in (low_results + high_results)
+        )
+        if any_judged:
+            header = "❌ <b>未達門檻</b>"
+            if low_label:
+                header += f"（資產 < {low_label}）"
+        else:
+            header = "⚠️ 兩個帳號都無法判讀（請查 log）"
+
+    return (
+        f"<b>UID</b> <code>{uid}</code>\n"
+        f"{header}\n\n"
+        f"<i>各帳號明細</i>\n" + "\n".join(detail_lines)
+    )
 
 
 def format_short_qual_multi(
@@ -624,55 +761,88 @@ def _sum_vol(vols: list[Any]) -> dict[str, float] | None:
 def format_full_result(
     uid: str,
     label: str,
-    per_acct: list[tuple[Account, Any, Any, Any]],
+    per_acct: list[tuple[Account, Any, Any, Any, Any]],
     threshold_label: str = "",
+    high_threshold_label: str = "",
 ) -> str:
-    """多帳號完整報告：KOL 狀態 + Asset 狀態 + 各帳號交易量 + 合計。"""
+    """多帳號完整報告：KOL + Asset Tier + 各帳號交易量 + 合計。
+
+    per_acct = list of (account, kol_qual, asset_low_qual, asset_high_qual, vol)
+    """
     # ----- KOL 整體判定 -----
-    kol_true = any(_qual_status(kq)[1] is True for _, kq, _, _ in per_acct)
-    kol_any = any(_qual_status(kq)[1] is not None for _, kq, _, _ in per_acct)
+    kol_true = any(_qual_status(kq)[1] is True for _, kq, _, _, _ in per_acct)
+    kol_any = any(_qual_status(kq)[1] is not None for _, kq, _, _, _ in per_acct)
     if kol_true:
-        hits = [a.label for a, kq, _, _ in per_acct if _qual_status(kq)[1] is True]
+        hits = [a.label for a, kq, _, _, _ in per_acct if _qual_status(kq)[1] is True]
         kol_line = f"✅ 是 KOL 用戶（{', '.join(hits)}）"
     elif kol_any:
         kol_line = "❌ 非任一帳號的 KOL 用戶"
     else:
         kol_line = "⚠️ 無法判讀（請查 log）"
 
-    # ----- Asset 整體判定 -----
-    asset_true = any(_qual_status(aq)[1] is True for _, _, aq, _ in per_acct)
-    asset_any = any(_qual_status(aq)[1] is not None for _, _, aq, _ in per_acct)
-    th = f"資產 ≥ {threshold_label}" if threshold_label else "資產達標"
-    if asset_true:
-        hits = [a.label for a, _, aq, _ in per_acct if _qual_status(aq)[1] is True]
-        asset_line = f"✅ {th}（{', '.join(hits)}）"
-    elif asset_any:
-        asset_line = f"❌ 不滿足 {th}"
+    # ----- Asset Tier 整體判定（取最高） -----
+    high_hits: list[str] = []
+    low_only_hits: list[str] = []
+    any_asset_judged = False
+    for a, _kq, lq, hq, _v in per_acct:
+        tier = _asset_tier_for(lq, hq)
+        if tier == "high":
+            high_hits.append(a.label)
+        elif tier == "low":
+            low_only_hits.append(a.label)
+        if tier != "unknown":
+            any_asset_judged = True
+
+    if high_hits:
+        asset_line = (
+            f"✅ <b>資產 ≥ {high_threshold_label or '高門檻'}</b>"
+            f"（{', '.join(high_hits)}）"
+        )
+    elif low_only_hits:
+        asset_line = (
+            f"✅ <b>資產 ≥ {threshold_label or '低門檻'}</b>"
+            f"（{', '.join(low_only_hits)}）"
+        )
+    elif any_asset_judged:
+        asset_line = (
+            f"❌ 未達門檻"
+            + (f"（< {threshold_label}）" if threshold_label else "")
+        )
     else:
         asset_line = "⚠️ 無法判讀（請查 log）"
 
     # ----- 各帳號交易量明細 + 合計 -----
     detail_lines = []
     vols = []
-    for a, kq, aq, v in per_acct:
+    for a, kq, lq, hq, v in per_acct:
         kol_icon = _qual_status(kq)[0]
-        asset_icon = _qual_status(aq)[0]
+        # asset 顯示「達到的最高 tier icon」：以 high → low 順序找有設定且 ✓
+        tier = _asset_tier_for(lq, hq)
+        if tier == "high":
+            asset_tag = f"Asset ✅ ≥{high_threshold_label or 'high'}"
+        elif tier == "low":
+            asset_tag = f"Asset ✅ ≥{threshold_label or 'low'}"
+        elif tier == "none":
+            asset_tag = "Asset ❌"
+        else:
+            asset_tag = "Asset ⚠️"
+
         if isinstance(v, dict) and "_skip" in v:
             detail_lines.append(
-                f"  • {a.label}：KOL {kol_icon} / Asset {asset_icon} ｜量: — (未設定 bot)"
+                f"  • {a.label}：KOL {kol_icon} / {asset_tag} ｜量: — (未設定 bot)"
             )
             vols.append(v)
             continue
         if isinstance(v, dict) and "_error" in v:
             detail_lines.append(
-                f"  • {a.label}：KOL {kol_icon} / Asset {asset_icon} ｜量: ⚠️ {_safe(v['_error'])[:60]}"
+                f"  • {a.label}：KOL {kol_icon} / {asset_tag} ｜量: ⚠️ {_safe(v['_error'])[:60]}"
             )
             vols.append(v)
             continue
         in_list = v["appeared_in_invite_list"]
         marker = "✓" if in_list else "·"
         detail_lines.append(
-            f"  • {a.label}：KOL {kol_icon} / Asset {asset_icon} {marker}"
+            f"  • {a.label}：KOL {kol_icon} / {asset_tag} {marker}"
             f" ｜Spot <code>{v['spot']:,.0f}</code>"
             f" / Perp <code>{v['perp']:,.0f}</code>"
             f" / 合計 <code>{v['total']:,.0f}</code>"
@@ -701,23 +871,39 @@ def format_full_result(
 
 def format_batch_multi(
     label: str,
-    items: list[tuple[str, list[tuple[Account, Any, Any, Any]]]],
+    items: list[tuple[str, list[tuple[Account, Any, Any, Any, Any]]]],
+    threshold_label: str = "",
+    high_threshold_label: str = "",
 ) -> str:
-    """批次查詢的精簡輸出：每個 UID 一行，含 KOL/Asset icon + 合計交易量。"""
+    """批次查詢的精簡輸出：每個 UID 一行，含 KOL + Asset tier + 合計交易量。"""
     lines = [f"<b>區間</b>：{label}\n"]
     for uid, per_acct in items:
-        kol_true = any(_qual_status(kq)[1] is True for _, kq, _, _ in per_acct)
-        kol_any = any(_qual_status(kq)[1] is not None for _, kq, _, _ in per_acct)
-        asset_true = any(_qual_status(aq)[1] is True for _, _, aq, _ in per_acct)
-        asset_any = any(_qual_status(aq)[1] is not None for _, _, aq, _ in per_acct)
+        kol_true = any(_qual_status(kq)[1] is True for _, kq, _, _, _ in per_acct)
+        kol_any = any(_qual_status(kq)[1] is not None for _, kq, _, _, _ in per_acct)
         k_icon = "✅" if kol_true else ("❌" if kol_any else "⚠️")
-        a_icon = "✅" if asset_true else ("❌" if asset_any else "⚠️")
-        summed = _sum_vol([v for _, _, _, v in per_acct])
+
+        # asset tier across accounts
+        best_tier = "unknown"
+        tier_rank = {"high": 3, "low": 2, "none": 1, "unknown": 0}
+        for _, _, lq, hq, _ in per_acct:
+            t = _asset_tier_for(lq, hq)
+            if tier_rank[t] > tier_rank[best_tier]:
+                best_tier = t
+        if best_tier == "high":
+            a_str = f"Asset ✅≥{high_threshold_label or 'high'}"
+        elif best_tier == "low":
+            a_str = f"Asset ✅≥{threshold_label or 'low'}"
+        elif best_tier == "none":
+            a_str = "Asset ❌"
+        else:
+            a_str = "Asset ⚠️"
+
+        summed = _sum_vol([v for _, _, _, _, v in per_acct])
         if summed is None:
-            lines.append(f"<code>{uid}</code> — KOL {k_icon} Asset {a_icon} ｜量: ⚠️")
+            lines.append(f"<code>{uid}</code> — KOL {k_icon} {a_str} ｜量: ⚠️")
             continue
         lines.append(
-            f"<code>{uid}</code> — KOL {k_icon} Asset {a_icon}"
+            f"<code>{uid}</code> — KOL {k_icon} {a_str}"
             f" ｜Spot <code>{summed['spot']:,.0f}</code>"
             f" ｜Perp <code>{summed['perp']:,.0f}</code>"
             f" ｜合計 <code>{summed['total']:,.0f}</code>"
@@ -836,9 +1022,15 @@ def _discover_accounts() -> list[Account]:
             continue
         kol = os.environ.get(f"PIONEX_{s}_BOT_ID_KOL", "").strip() or None
         asset = os.environ.get(f"PIONEX_{s}_BOT_ID_ASSET", "").strip() or None
+        asset_high = (
+            os.environ.get(f"PIONEX_{s}_BOT_ID_ASSET_HIGH", "").strip() or None
+        )
         label = os.environ.get(f"PIONEX_{s}_LABEL", "").strip() or f"帳號 {s}"
-        if not (kol or asset):
-            log.warning("帳號 %s 沒有 BOT_ID_KOL/_ASSET，無法做任何查詢，跳過", s)
+        if not (kol or asset or asset_high):
+            log.warning(
+                "帳號 %s 沒有 BOT_ID_KOL / _ASSET / _ASSET_HIGH，無法做任何查詢，跳過",
+                s,
+            )
             continue
         accounts.append(
             Account(
@@ -846,6 +1038,7 @@ def _discover_accounts() -> list[Account]:
                 client=PionexClient(PionexCreds(key, sec)),
                 bot_id_kol=kol,
                 bot_id_asset=asset,
+                bot_id_asset_high=asset_high,
             )
         )
     return accounts
@@ -871,6 +1064,9 @@ def main() -> None:
 
     tg_token = _from_env_or_ask("TELEGRAM_BOT_TOKEN", "Telegram Bot Token", secret=True)
     asset_threshold_label = os.environ.get("PIONEX_ASSET_THRESHOLD_LABEL", "").strip()
+    asset_high_threshold_label = os.environ.get(
+        "PIONEX_ASSET_HIGH_THRESHOLD_LABEL", ""
+    ).strip()
 
     allowed_raw = os.environ.get("ALLOWED_CHAT_IDS", "").strip()
     if allowed_raw:
@@ -888,16 +1084,19 @@ def main() -> None:
 
     print(f"\n✅ 載入 {len(accounts)} 個帳號：")
     for a in accounts:
-        kol_tag = f"KOL ✓" if a.bot_id_kol else "KOL ✗"
-        ast_tag = f"ASSET ✓" if a.bot_id_asset else "ASSET ✗"
-        print(f"   • {a.label}：{kol_tag} / {ast_tag}")
-    print(f"   threshold={asset_threshold_label or '(未設定)'}")
+        kol_tag = "KOL ✓" if a.bot_id_kol else "KOL ✗"
+        low_tag = "ASSET ✓" if a.bot_id_asset else "ASSET ✗"
+        high_tag = "ASSET_HIGH ✓" if a.bot_id_asset_high else "ASSET_HIGH ✗"
+        print(f"   • {a.label}：{kol_tag} / {low_tag} / {high_tag}")
+    print(f"   low threshold  = {asset_threshold_label or '(未設定)'}")
+    print(f"   high threshold = {asset_high_threshold_label or '(未設定)'}")
     print(f"   監聽 {len(allowed)} 個 chat：{sorted(allowed)}")
 
     bot = TGBot(
         accounts=accounts,
         allowed_chat_ids=allowed,
         asset_threshold_label=asset_threshold_label,
+        asset_high_threshold_label=asset_high_threshold_label,
     )
 
     app = Application.builder().token(tg_token).build()
