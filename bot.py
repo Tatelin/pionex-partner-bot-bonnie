@@ -678,7 +678,7 @@ def format_asset_tier_multi(
         if any_judged:
             header = "❌ <b>未達門檻</b>"
             if low_label:
-                header += f"（資產 < {low_label}）"
+                header += f"（資產 &lt; {low_label}）"
         else:
             header = "⚠️ 兩個帳號都無法判讀（請查 log）"
 
@@ -806,7 +806,7 @@ def format_full_result(
     elif any_asset_judged:
         asset_line = (
             f"❌ 未達門檻"
-            + (f"（< {threshold_label}）" if threshold_label else "")
+            + (f"（&lt; {threshold_label}）" if threshold_label else "")
         )
     else:
         asset_line = "⚠️ 無法判讀（請查 log）"
