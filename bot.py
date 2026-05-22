@@ -747,7 +747,23 @@ def _load_env_file(path: Path) -> None:
             os.environ[key] = val
 
 
+def _is_interactive() -> bool:
+    """stdin 是否為終端機；雲端容器（Railway/Docker/systemd）通常為 False。"""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def _ask(label: str, secret: bool = False) -> str:
+    if not _is_interactive():
+        env_hint = label.replace(" ", "_").upper()
+        print(
+            f"❌ 找不到必要設定『{label}』，且目前是無頭環境（無法互動式輸入）。\n"
+            f"   請到 Railway / .env 把對應變數設好後再啟動。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     while True:
         val = (getpass.getpass(f"{label}: ") if secret else input(f"{label}: ")).strip()
         if val:
@@ -769,6 +785,13 @@ def _parse_chat_ids(raw: str) -> set[int]:
 
 
 def _ask_chat_ids() -> set[int]:
+    if not _is_interactive():
+        print(
+            "❌ 缺少 ALLOWED_CHAT_IDS，且目前是無頭環境（無法互動式輸入）。\n"
+            "   請到 Railway 的 Variables 加上 ALLOWED_CHAT_IDS=<群組 chat_id>。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     while True:
         raw = input(
             "允許的 TG 群組 chat_id（多個用逗號分隔；群組通常是負數，supergroup 以 -100 開頭）: "
