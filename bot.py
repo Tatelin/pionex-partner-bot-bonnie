@@ -49,7 +49,7 @@ UID_TOKEN_RE = re.compile(r"(?<!\d)\d{8}(?!\d)")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DEFAULT_DAYS = 30
 MAX_DAYS = 365
-MAX_BATCH_UIDS = 5
+MAX_BATCH_UIDS = 20
 STAT_CACHE_TTL = 300  # 5 分鐘，避免短時間內重複拉同一區間
 HTTP_TIMEOUT = 15
 ENV_FILE = Path(__file__).resolve().parent / ".env"
@@ -287,7 +287,7 @@ HELP_TEXT = (
     "• <code>/asset &lt;UID&gt;</code> — KOL + 資產是否達門檻\n\n"
     "<b>完整報告（含交易量）</b>\n"
     "• 直接貼 UID：<code>12345678</code> — 近 30 天\n"
-    "• 一次最多 5 個（空白、逗號或換行分隔）\n"
+    "• 一次最多 20 個（空白、逗號或換行分隔）\n"
     "• <code>/check &lt;UID&gt; &lt;天數&gt;</code> — 例：<code>/check 12345678 7</code>\n"
     "• <code>/check &lt;UID&gt; &lt;YYYY-MM-DD&gt; &lt;YYYY-MM-DD&gt;</code> — 自訂區間\n\n"
     "UID 為 8 位純數字。"
