@@ -84,6 +84,7 @@ class PionexClient:
     def __init__(self, creds: PionexCreds):
         self.creds = creds
         self._stat_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+        self._qual_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
         self._semaphore: asyncio.Semaphore | None = None
 
     def _get_semaphore(self) -> asyncio.Semaphore:
@@ -109,7 +110,6 @@ class PionexClient:
             return await loop.run_in_executor(
                 None, self.trade_volume_for_uid, uid, start, end
             )
-        self._qual_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
     def _signed_get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         params = dict(params)
