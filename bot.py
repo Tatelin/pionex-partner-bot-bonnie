@@ -79,9 +79,36 @@ class PionexError(Exception):
 
 
 class PionexClient:
+    MAX_CONCURRENT = 3  # 每帳號同時最多 N 個 API 呼叫，避免 Pionex rate limit
+
     def __init__(self, creds: PionexCreds):
         self.creds = creds
         self._stat_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+        self._semaphore: asyncio.Semaphore | None = None
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        # 延遲到當前 event loop 才建立 semaphore（lazy init）
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
+        return self._semaphore
+
+    async def check_qualification_async(
+        self, uid: str, bot_id: str
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        async with self._get_semaphore():
+            return await loop.run_in_executor(
+                None, self.check_qualification, uid, bot_id
+            )
+
+    async def trade_volume_for_uid_async(
+        self, uid: str, start: str, end: str
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        async with self._get_semaphore():
+            return await loop.run_in_executor(
+                None, self.trade_volume_for_uid, uid, start, end
+            )
         self._qual_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
     def _signed_get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
@@ -501,8 +528,6 @@ class TGBot:
 
         mode = 'kol' | 'asset_low' | 'asset_high'
         """
-        loop = asyncio.get_running_loop()
-
         def pick_bot(a: Account) -> str | None:
             if mode == "kol":
                 return a.bot_id_kol
@@ -517,9 +542,7 @@ class TGBot:
             if not bot_id:
                 return a, {"_skip": True}
             try:
-                qual = await loop.run_in_executor(
-                    None, a.client.check_qualification, uid, bot_id
-                )
+                qual = await a.client.check_qualification_async(uid, bot_id)
             except Exception as e:
                 log.exception("checkQualification failed account=%s uid=%s", a.label, uid)
                 qual = {"_error": str(e)}
@@ -529,40 +552,34 @@ class TGBot:
     async def _check_full_all(
         self, uid: str, start: str, end: str
     ) -> list[tuple[Account, Any, Any, Any, Any]]:
-        """對所有帳號平行做 KOL + 低門檻 + 高門檻 + 交易量。
+        """對所有帳號做 KOL + 低門檻 + 高門檻 + 交易量。
 
         Returns list of (account, kol_qual, asset_low_qual, asset_high_qual, vol).
-        若某帳號沒設定對應 bot_id，相應槽位回 {"_skip": True}。
+        每個 PionexClient 內部 semaphore 會自動節流，避免 burst 過大造成 rate limit。
         """
-        loop = asyncio.get_running_loop()
 
         async def call_qual(a: Account, bot_id: str | None) -> Any:
             if not bot_id:
                 return {"_skip": True}
             try:
-                return await loop.run_in_executor(
-                    None, a.client.check_qualification, uid, bot_id
-                )
+                return await a.client.check_qualification_async(uid, bot_id)
             except Exception as e:
                 log.exception("checkQualification failed account=%s uid=%s", a.label, uid)
                 return {"_error": str(e)}
 
+        async def vol_call(a: Account) -> Any:
+            try:
+                return await a.client.trade_volume_for_uid_async(uid, start, end)
+            except Exception as e:
+                log.exception("inviteTradeStat failed account=%s", a.label)
+                return {"_error": str(e)}
+
         async def one(a: Account) -> tuple[Account, Any, Any, Any, Any]:
-            kol_t = call_qual(a, a.bot_id_kol)
-            low_t = call_qual(a, a.bot_id_asset)
-            high_t = call_qual(a, a.bot_id_asset_high)
-
-            async def vol_call():
-                try:
-                    return await loop.run_in_executor(
-                        None, a.client.trade_volume_for_uid, uid, start, end
-                    )
-                except Exception as e:
-                    log.exception("inviteTradeStat failed account=%s", a.label)
-                    return {"_error": str(e)}
-
             kol_q, low_q, high_q, vol = await asyncio.gather(
-                kol_t, low_t, high_t, vol_call()
+                call_qual(a, a.bot_id_kol),
+                call_qual(a, a.bot_id_asset),
+                call_qual(a, a.bot_id_asset_high),
+                vol_call(a),
             )
             return a, kol_q, low_q, high_q, vol
 
